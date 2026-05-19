@@ -1,7 +1,7 @@
 import pandas as pd
 import glob
+import re
 
-# Getting relevant data
 csv_file = glob.glob("*.csv")
 df = pd.read_csv(csv_file[0])
 data = pd.DataFrame()
@@ -12,27 +12,42 @@ data['Print time (min)'] = df['Elapsed print time (ms)']/60000
 data['Status'] = df['Status']
 data['Printer Serial'] = df['Printer'].str.split('-', n=1).str[1]
 data['Model list'] = df['Parts'].str.split(', ').apply(lambda x: ['-'.join(name.split('_')[:1]) for name in x if name != 'Dentsply-form-spin-frame-punched'])
+data['Volume (L)'] = df['Volume (ml)']/1000
+data['Start time'] = pd.to_datetime(df['Start time'])
+data['Finish time'] = pd.to_datetime(df['Finish time'])
 
-# Processing relevant data
-arches = data['No. of Arches'].mean() # Arches per print
+arches = data['No. of Arches'].mean() 
 totalArches = data['No. of Arches'].sum()
-printTime = data['Print time (min)'].where(~data['Status'].isin(['ABORTED', 'ERROR'])).mean() # Average print time ignoring prints that were aborted or errored out
-archesPH = totalArches/47 # Throughput 
-reported = 52 # For print defects reported downstream and arches that didn't pass inspection
-checks = 0 # False alarms, manually aborted, etc.
-pDowntime = 0.3 # Time spent doing maintenance per printer in hours
-upDowntime = 0 # Time spent doing unplanned repairs in hours
+printTime = data['Print time (min)'].where(~data['Status'].isin(['ABORTED', 'ERROR'])).mean() 
+resinAvg = data['Volume (L)'].mean()
+resinTot = data['Volume (L)'].sum()
+archesPH = totalArches/132 
+reported = 0 
+checks = 0 
+pDowntime = 0.3 
+upDowntime = 0 
 allPrints = (data['Status'] != '').sum()
-failCount = (data['Status'].isin(['ERROR', 'ABORTED', ''] or data['Print time (min)']<10)).sum() # For unfinished as stated in STATUS and downstream defects
-finished = (data['Status'] == 'FINISHED').sum() # Prints successfully completed
-failedArch = (reported/(totalArches + failCount*arches))*100 # Arches that didn't pass inspection
+failCount = (data['Status'].isin(['ERROR', 'ABORTED', ''] or data['Print time (min)']<10)).sum() 
+finished = (data['Status'] == 'FINISHED').sum() 
+failedArch = (reported/(totalArches + failCount*arches))*100 
 failRate = (failCount/(allPrints))*100
 
-# Adjust last number here to total number of hours (16.5 per day 80 for a week) being considered for the uptime calculation
-uptime = ((data['Print time (min)'].where(~data['Status'].isin(['ABORTED', 'ERROR'])).sum()/60)/(12*47))*100 # Time actually printing over a full week
+data_sorted = data.sort_values(by=['Printer Serial', 'Start time']).copy() 
+data_sorted['Previous Finish'] = data_sorted.groupby('Printer Serial')['Finish time'].shift(1)
+data_sorted['Idle Time'] = data_sorted['Start time'] - data_sorted['Previous Finish']
 
-# Print out stats
-#print(data.head())
+valid_idle = data_sorted['Idle Time'].dropna()
+valid_idle = valid_idle[valid_idle.dt.total_seconds() > 0]
+avg_idle_time = valid_idle.mean()
+avg_idle_minutes = avg_idle_time.total_seconds() / 60
+
+valid_idle_filtered = data_sorted['Idle Time'].dropna()
+valid_idle_filtered = valid_idle_filtered[(valid_idle_filtered.dt.total_seconds() > 0) & (valid_idle_filtered.dt.total_seconds() <= 1800)]
+median_idle_time = valid_idle_filtered.median()
+median_idle_minutes = median_idle_time.total_seconds() / 60
+
+uptime = ((data['Print time (min)'].where(~data['Status'].isin(['ABORTED', 'ERROR'])).sum()/60)/(12*16.5))*100 
+
 print(totalArches, 'arches in', finished, 'prints.')
 print('Average of', round(archesPH, 2), 'arches per hour')
 print("Number of arches per print:", round(arches, 2))
@@ -40,3 +55,47 @@ print("Print time in minutes:", round(printTime, 2))
 print('Percentage of failed prints:', round(failRate, 2), "%")
 print('Percentage of failed arches:', round(failedArch, 2), "%")
 print(f'~{round(uptime, 2)}% percent of work hours spent printing')
+print('Estimated resin use per print (L):', round(resinAvg, 2))
+print('Estimated total resin used (L):', round(resinTot, 2))
+print(f"Average time between prints: {round(avg_idle_minutes, 2)} minutes")
+print(f"Median time between prints: {round(median_idle_minutes, 2)} minutes")
+
+target_file = 'SO-SR03000838-Arch-019-036'
+matching_rows = data[data['Model list'].apply(lambda models: target_file in models if isinstance(models, list) else False)]
+batches_found = matching_rows['Batch'].unique().tolist()
+
+if not matching_rows.empty:
+    print(f"\nFile '{target_file}' found in:")
+    unique_matches = matching_rows[['Batch', 'Printer Serial']].drop_duplicates()
+    for _, row in unique_matches.iterrows():
+        print(f" - Batch: {row['Batch']} | Printer: {row['Printer Serial']}")
+else:
+    print(f"\nFile '{target_file}' was not found in any batch.")
+
+data_sorted = data.sort_values(by=['Printer Serial', 'Start time']).copy()
+data_sorted['Previous Finish'] = data_sorted.groupby('Printer Serial')['Finish time'].shift(1)
+data_sorted['Idle Time'] = (data_sorted['Start time'] - data_sorted['Previous Finish']).dt.total_seconds() / 60
+
+def get_avg_idle(series):
+    valid = series[series > 0]
+    return valid.mean()
+
+def get_median_idle(series):
+    valid = series[(series > 0) & (series <= 60)]
+    return valid.median()
+
+printer_stats = data_sorted.groupby('Printer Serial').agg(
+    Total_Prints=('Printer Serial', 'count'),
+    Avg_Print_Time=('Print time (min)', 'mean'),
+    Avg_Idle_Time=('Idle Time', get_avg_idle),
+    Median_Idle_Time=('Idle Time', get_median_idle)
+).reset_index()
+
+printer_stats['Avg_Print_Time'] = printer_stats['Avg_Print_Time'].round(2)
+printer_stats['Avg_Idle_Time'] = printer_stats['Avg_Idle_Time'].round(2)
+printer_stats['Median_Idle_Time'] = printer_stats['Median_Idle_Time'].round(2)
+
+printer_stats.columns = ['Printer', 'Total Prints', 'Avg Print Time (min)', 'Avg Time Between (min)', 'Median Time Between (min)']
+
+print("\n--- STATS BY PRINTER ---")
+print(printer_stats.to_string(index=False))
