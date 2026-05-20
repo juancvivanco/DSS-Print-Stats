@@ -5,32 +5,45 @@ import re
 csv_file = glob.glob("*.csv")
 df = pd.read_csv(csv_file[0])
 data = pd.DataFrame()
+
 data[['Batch', 'No. of Arches','Batch ID']] = df['Print name'].str.split('_', n = 2, expand = True)
 data = data.drop(columns=['Batch ID'])
 data['No. of Arches'] = data['No. of Arches'].str[:-1].astype(int)
-data['Print time (min)'] = df['Elapsed print time (ms)']/60000
+
+data['Start time'] = pd.to_datetime(df['Start time'])
+data['Finish time'] = pd.to_datetime(df['Finish time'])
+data['Print time (min)'] = (data['Finish time'] - data['Start time']).dt.total_seconds() / 60
+
 data['Status'] = df['Status']
 data['Printer Serial'] = df['Printer'].str.split('-', n=1).str[1]
 data['Model list'] = df['Parts'].str.split(', ').apply(lambda x: ['-'.join(name.split('_')[:1]) for name in x if name != 'Dentsply-form-spin-frame-punched'])
 data['Volume (L)'] = df['Volume (ml)']/1000
-data['Start time'] = pd.to_datetime(df['Start time'])
-data['Finish time'] = pd.to_datetime(df['Finish time'])
 
 arches = data['No. of Arches'].mean() 
 totalArches = data['No. of Arches'].sum()
 printTime = data['Print time (min)'].where(~data['Status'].isin(['ABORTED', 'ERROR'])).mean() 
 resinAvg = data['Volume (L)'].mean()
 resinTot = data['Volume (L)'].sum()
-archesPH = totalArches/132 
 reported = 0 
 checks = 0 
 pDowntime = 0.3 
 upDowntime = 0 
-allPrints = (data['Status'] != '').sum()
 failCount = (data['Status'].isin(['ERROR', 'ABORTED', ''] or data['Print time (min)']<10)).sum() 
 finished = (data['Status'] == 'FINISHED').sum() 
 failedArch = (reported/(totalArches + failCount*arches))*100 
-failRate = (failCount/(allPrints))*100
+
+# --- TRUE OPERATOR THROUGHPUT CALCULATOR ---
+first_start = data['Start time'].min()
+last_start = data['Start time'].max()
+operator_span_hours = (last_start - first_start).total_seconds() / 3600
+avg_print_hours = printTime / 60
+breaks_hours = 2 
+total_active_hours = operator_span_hours + avg_print_hours - breaks_hours
+
+if total_active_hours > 0:
+    archesPH = totalArches / total_active_hours
+else:
+    archesPH = 0
 
 data_sorted = data.sort_values(by=['Printer Serial', 'Start time']).copy() 
 data_sorted['Previous Finish'] = data_sorted.groupby('Printer Serial')['Finish time'].shift(1)
@@ -50,19 +63,17 @@ uptime = ((data['Print time (min)'].where(~data['Status'].isin(['ABORTED', 'ERRO
 
 print(totalArches, 'arches in', finished, 'prints.')
 print('Average of', round(archesPH, 2), 'arches per hour')
+print('Total active printing hours', round(total_active_hours, 2))
 print("Number of arches per print:", round(arches, 2))
 print("Print time in minutes:", round(printTime, 2))
-print('Percentage of failed prints:', round(failRate, 2), "%")
-print('Percentage of failed arches:', round(failedArch, 2), "%")
 print(f'~{round(uptime, 2)}% percent of work hours spent printing')
 print('Estimated resin use per print (L):', round(resinAvg, 2))
 print('Estimated total resin used (L):', round(resinTot, 2))
 print(f"Average time between prints: {round(avg_idle_minutes, 2)} minutes")
 print(f"Median time between prints: {round(median_idle_minutes, 2)} minutes")
 
-target_file = 'SO-SR03000838-Arch-019-036'
+target_file = 'SO-SR03000831-Arch-018-074'
 matching_rows = data[data['Model list'].apply(lambda models: target_file in models if isinstance(models, list) else False)]
-batches_found = matching_rows['Batch'].unique().tolist()
 
 if not matching_rows.empty:
     print(f"\nFile '{target_file}' found in:")
